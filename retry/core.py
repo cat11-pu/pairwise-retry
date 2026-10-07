@@ -70,9 +70,9 @@ class BackoffPolicy:
         attempt = _check_int(attempt, "attempt", 1)
         delay = self.base_ticks
         for _ in range(attempt - 1):
-            if self.max_ticks is not None and delay >= self.max_ticks:
-                return delay
             delay *= self.multiplier
+            if self.max_ticks is not None and delay > self.max_ticks:
+                delay = self.max_ticks
         return delay
 
     def delay(self, attempt):
@@ -81,6 +81,7 @@ class BackoffPolicy:
         if not self.jitter:
             return raw
         permille = self.jitter[self._cursor % len(self.jitter)]
+        self._cursor += 1
         return raw - (raw * permille) // MILLI
 
 
@@ -142,7 +143,7 @@ class CircuitBreaker:
         if self._state == OPEN:
             self.rejected += 1
             return False
-        if self._state == HALF_OPEN and self._probes > self.half_open_limit:
+        if self._state == HALF_OPEN and self._probes >= self.half_open_limit:
             self.rejected += 1
             return False
         self._probes += 1
@@ -158,14 +159,19 @@ class CircuitBreaker:
             if self._consecutive_successes >= self.success_threshold:
                 self._consecutive_successes = 0
                 self._reset(CLOSED)
+        elif self._state == CLOSED:
+            self._release()
+            self._consecutive_failures = 0
 
     def on_failure(self, now):
         """报告一次失败：半开态立刻打回打开，闭合态累计连续失败。"""
         now = int(now)
         self._advance(now)
         if self._state == HALF_OPEN:
-            self._release()
             self._consecutive_successes = 0
+            self._trip(now)
+            return
+        self._release()
         self._consecutive_failures += 1
         if self._consecutive_failures >= self.failure_threshold:
             self._trip(now)
@@ -174,7 +180,7 @@ class CircuitBreaker:
 
     def _advance(self, now):
         """按注入刻度推进时间：打开时长走满就转入半开。"""
-        if self._state == OPEN and now - self._opened_at > self.open_ticks:
+        if self._state == OPEN and now - self._opened_at >= self.open_ticks:
             self._reset(HALF_OPEN)
 
     def _release(self):
@@ -291,11 +297,10 @@ class RetryKernel:
                 break
             if outcome == TIMEOUT:
                 self.timeouts += 1
-            else:
-                self.failures += 1
-                if self.breaker is not None:
-                    self.breaker.on_failure(now)
-            if made > self.max_attempts:
+            self.failures += 1
+            if self.breaker is not None:
+                self.breaker.on_failure(now)
+            if made >= self.max_attempts:
                 reason = "exhausted"
                 break
             delay = self.policy.delay(made)
